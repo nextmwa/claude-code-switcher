@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+
+import json
+import os
+import sys
+import subprocess
+from pathlib import Path
+
+SWITCHER_DIR = Path.home() / ".claude-switcher"
+ACCOUNTS_DIR = SWITCHER_DIR / "accounts"
+CLAUDE_JSON = Path.home() / ".claude.json"
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+SWITCHER_KEYCHAIN_SERVICE = "Claude Code-switcher"
+
+RED    = '\033[0;31m'
+GREEN  = '\033[0;32m'
+YELLOW = '\033[1;33m'
+CYAN   = '\033[0;36m'
+BOLD   = '\033[1m'
+DIM    = '\033[2m'
+NC     = '\033[0m'
+
+def setup():
+    ACCOUNTS_DIR.mkdir(parents=True, exist_ok=True)
+    SWITCHER_DIR.chmod(0o700)
+    ACCOUNTS_DIR.chmod(0o700)
+
+def read_claude_json():
+    with open(CLAUDE_JSON) as f:
+        return json.load(f)
+
+def write_claude_json(data):
+    tmp = CLAUDE_JSON.with_suffix('.json.tmp')
+    with open(tmp, 'w') as f:
+        json.dump(data, f, indent=2)
+    tmp.replace(CLAUDE_JSON)
+
+def get_current_account():
+    try:
+        return read_claude_json().get('oauthAccount', {})
+    except Exception:
+        return {}
+
+def get_keychain_credentials():
+    result = subprocess.run(
+        ['security', 'find-generic-password', '-l', KEYCHAIN_SERVICE, '-g'],
+        capture_output=True, text=True
+    )
+    output = result.stderr + result.stdout
+    for line in output.splitlines():
+        if 'password:' in line:
+            try:
+                start = line.index('"') + 1
+                end = line.rindex('"')
+                return line[start:end]
+            except ValueError:
+                pass
+    return None
+
+def set_keychain_credentials(credentials: str) -> bool:
+    subprocess.run(
+        ['security', 'delete-generic-password', '-l', KEYCHAIN_SERVICE],
+        capture_output=True
+    )
+    result = subprocess.run(
+        ['security', 'add-generic-password',
+         '-a', os.environ.get('USER', 'user'),
+         '-s', KEYCHAIN_SERVICE,
+         '-w', credentials],
+        capture_output=True, text=True
+    )
+    return result.returncode == 0
+
+# --- per-profile Keychain helpers ---
+
+def get_profile_credentials(email: str):
+    result = subprocess.run(
+        ['security', 'find-generic-password',
+         '-s', SWITCHER_KEYCHAIN_SERVICE, '-a', email, '-g'],
+        capture_output=True, text=True
+    )
+    output = result.stderr + result.stdout
+    for line in output.splitlines():
+        if 'password:' in line:
+            try:
+                start = line.index('"') + 1
+                end = line.rindex('"')
+                return line[start:end]
+            except ValueError:
+                pass
+    return None
+
+def set_profile_credentials(email: str, credentials: str) -> bool:
+    subprocess.run(
+        ['security', 'delete-generic-password',
+         '-s', SWITCHER_KEYCHAIN_SERVICE, '-a', email],
+        capture_output=True
+    )
+    result = subprocess.run(
+        ['security', 'add-generic-password',
+         '-s', SWITCHER_KEYCHAIN_SERVICE,
+         '-a', email,
+         '-w', credentials],
+        capture_output=True, text=True
+    )
+    return result.returncode == 0
+
+def delete_profile_credentials(email: str):
+    subprocess.run(
+        ['security', 'delete-generic-password',
+         '-s', SWITCHER_KEYCHAIN_SERVICE, '-a', email],
+        capture_output=True
+    )
+
+# --- profile file helpers ---
+
+def account_filename(email: str) -> Path:
+    safe = email.replace('@', '_at_').replace('.', '_').replace('+', '_')
+    return ACCOUNTS_DIR / f"{safe}.json"
+
+def list_saved_accounts():
+    if not ACCOUNTS_DIR.exists():
+        return []
+    accounts = []
+    for f in sorted(ACCOUNTS_DIR.glob('*.json')):
+        try:
+            profile = json.loads(f.read_text())
+            accounts.append(profile)
+        except Exception:
+            pass
+    return sorted(accounts, key=lambda x: x.get('email', ''))
+
+def save_current_account():
+    account = get_current_account()
+    email = account.get('emailAddress', '')
+
+    if not email:
+        print(f"{RED}Error: no account currently logged in.{NC}")
+        sys.exit(1)
+
+    credentials = get_keychain_credentials()
+    if not credentials:
+        print(f"{RED}Error: could not read credentials from keychain.{NC}")
+        sys.exit(1)
+
+    if not set_profile_credentials(email, credentials):
+        print(f"{RED}Error: could not save credentials to keychain.{NC}")
+        sys.exit(1)
+
+    d = read_claude_json()
+    profile = {
+        'email': email,
+        'displayName': account.get('displayName', ''),
+        'oauthAccount': account,
+        'userID': d.get('userID', ''),
+    }
+
+    path = account_filename(email)
+    path.write_text(json.dumps(profile, indent=2))
+    path.chmod(0o600)
+
+    name = account.get('displayName', email)
+    print(f"{GREEN}✓ Saved:{NC} {BOLD}{email}{NC} ({name})")
+
+def switch_to_account(profile: dict):
+    email = profile['email']
+    credentials = get_profile_credentials(email)
+    if not credentials:
+        print(f"{RED}Error: no credentials found in keychain for {email}.{NC}")
+        sys.exit(1)
+
+    if not set_keychain_credentials(credentials):
+        print(f"{RED}Error: could not update keychain.{NC}")
+        sys.exit(1)
+
+    d = read_claude_json()
+    d['oauthAccount'] = profile['oauthAccount']
+    d['userID'] = profile['userID']
+    write_claude_json(d)
+
+    name = profile.get('displayName', email)
+    print(f"{GREEN}✓ Switched to:{NC} {BOLD}{email}{NC} ({name})")
+    print(f"{DIM}Restart Claude Code if it is already running.{NC}")
+
+def cmd_list():
+    saved = list_saved_accounts()
+    current_email = get_current_account().get('emailAddress', '')
+
+    if not saved:
+        print(f"{YELLOW}No accounts saved. Run{NC} {BOLD}claude-switch save{NC} {YELLOW}to save the current account.{NC}")
+        return
+
+    print(f"\n{BOLD}Saved accounts:{NC}")
+    for acc in saved:
+        marker = f"  {GREEN}← active{NC}" if acc['email'] == current_email else ""
+        print(f"  • {BOLD}{acc['email']}{NC} ({acc.get('displayName', '')}){marker}")
+    print()
+
+def interactive_switch():
+    current = get_current_account()
+    current_email = current.get('emailAddress', '')
+
+    print(f"\n{BOLD}Claude Code — Account Switcher{NC}")
+    print('─' * 42)
+
+    if current_email:
+        name = current.get('displayName', current_email)
+        print(f"  Active:  {CYAN}{BOLD}{current_email}{NC} ({name})")
+    else:
+        print(f"  {YELLOW}No account currently active{NC}")
+
+    saved = list_saved_accounts()
+    others = [a for a in saved if a['email'] != current_email]
+
+    print(f"\n  Other saved accounts:")
+    if not others:
+        print(f"  {DIM}None.{NC}")
+        print()
+        _print_setup_hint(current_email, saved)
+        return
+
+    for i, acc in enumerate(others, 1):
+        name = acc.get('displayName', acc['email'])
+        print(f"  {BOLD}[{i}]{NC} {acc['email']} ({name})")
+
+    print()
+    _print_setup_hint(current_email, saved)
+
+    try:
+        if len(others) == 1:
+            prompt = f"  Switch to {BOLD}{others[0]['email']}{NC}? [y/N] "
+            choice = input(prompt).strip().lower()
+            if choice in ('y', 'yes'):
+                switch_to_account(others[0])
+            else:
+                print("  No changes made.")
+        else:
+            choice = input(f"  Select [1-{len(others)}] or Enter to cancel: ").strip()
+            if not choice:
+                print("  No changes made.")
+                return
+            idx = int(choice) - 1
+            if 0 <= idx < len(others):
+                switch_to_account(others[idx])
+            else:
+                print(f"{RED}  Invalid selection.{NC}")
+    except (ValueError, KeyboardInterrupt, EOFError):
+        print("\n  No changes made.")
+
+def _print_setup_hint(current_email, saved):
+    if not any(a['email'] == current_email for a in saved):
+        print(f"  {DIM}Tip: run {BOLD}claude-switch save{NC}{DIM} to save the current account.{NC}")
+    print()
+
+def show_help():
+    print(f"""
+{BOLD}claude-switch{NC} — Switch between Claude Code accounts without re-authenticating
+
+{BOLD}Usage:{NC}
+  claude-switch              Interactive switcher
+  claude-switch save         Save current credentials as a profile
+  claude-switch list         List all saved profiles
+  claude-switch use <email>  Switch non-interactively
+
+{BOLD}First-time setup:{NC}
+  1. You're logged in as account A — run:  {BOLD}claude-switch save{NC}
+  2. Log out and log in as account B
+  3. Save it too:                          {BOLD}claude-switch save{NC}
+  4. Switch at any time with:              {BOLD}claude-switch{NC}
+""")
+
+def main():
+    setup()
+    args = sys.argv[1:]
+
+    if not args:
+        interactive_switch()
+    elif args[0] == 'save':
+        save_current_account()
+    elif args[0] == 'list':
+        cmd_list()
+    elif args[0] == 'use':
+        if len(args) < 2:
+            print(f"{RED}Usage: claude-switch use <email>{NC}")
+            sys.exit(1)
+        email = args[1]
+        saved = list_saved_accounts()
+        match = next((a for a in saved if a['email'] == email), None)
+        if not match:
+            print(f"{RED}Account '{email}' not found. Run 'claude-switch list' to see saved accounts.{NC}")
+            sys.exit(1)
+        switch_to_account(match)
+    elif args[0] in ('help', '--help', '-h'):
+        show_help()
+    else:
+        print(f"{RED}Unknown command: {args[0]}{NC}")
+        show_help()
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
