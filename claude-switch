@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 
 import json
 import os
+import shlex
 import sys
 import subprocess
 from pathlib import Path
+import time
 
 SWITCHER_DIR = Path.home() / ".claude-switcher"
 ACCOUNTS_DIR = SWITCHER_DIR / "accounts"
 CLAUDE_JSON = Path.home() / ".claude.json"
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 SWITCHER_KEYCHAIN_SERVICE = "Claude Code-switcher"
+CREDENTIAL_VERSION = 2
 
 RED    = '\033[0;31m'
 GREEN  = '\033[0;32m'
@@ -43,18 +47,11 @@ def get_current_account():
 
 def get_keychain_credentials():
     result = subprocess.run(
-        ['security', 'find-generic-password', '-l', KEYCHAIN_SERVICE, '-g'],
+        ['security', 'find-generic-password', '-l', KEYCHAIN_SERVICE, '-w'],
         capture_output=True, text=True
     )
-    output = result.stderr + result.stdout
-    for line in output.splitlines():
-        if 'password:' in line:
-            try:
-                start = line.index('"') + 1
-                end = line.rindex('"')
-                return line[start:end]
-            except ValueError:
-                pass
+    if result.returncode == 0:
+        return result.stdout.strip() or None
     return None
 
 def set_keychain_credentials(credentials: str) -> bool:
@@ -76,18 +73,11 @@ def set_keychain_credentials(credentials: str) -> bool:
 def get_profile_credentials(email: str):
     result = subprocess.run(
         ['security', 'find-generic-password',
-         '-s', SWITCHER_KEYCHAIN_SERVICE, '-a', email, '-g'],
+         '-s', SWITCHER_KEYCHAIN_SERVICE, '-a', email, '-w'],
         capture_output=True, text=True
     )
-    output = result.stderr + result.stdout
-    for line in output.splitlines():
-        if 'password:' in line:
-            try:
-                start = line.index('"') + 1
-                end = line.rindex('"')
-                return line[start:end]
-            except ValueError:
-                pass
+    if result.returncode == 0:
+        return result.stdout.strip() or None
     return None
 
 def set_profile_credentials(email: str, credentials: str) -> bool:
@@ -111,6 +101,42 @@ def delete_profile_credentials(email: str):
          '-s', SWITCHER_KEYCHAIN_SERVICE, '-a', email],
         capture_output=True
     )
+
+# --- session helpers ---
+
+def project_dir_name(path: str) -> str:
+    return path.replace('/', '-')
+
+def get_last_session(project_path: str | None = None) -> dict | None:
+    projects_dir = Path.home() / ".claude" / "projects"
+    if not projects_dir.exists():
+        return None
+
+    if project_path:
+        encoded = project_dir_name(project_path)
+        search_dirs = [projects_dir / encoded]
+    else:
+        search_dirs = [d for d in projects_dir.iterdir() if d.is_dir()]
+
+    latest_file = None
+    latest_mtime = 0
+
+    for proj_dir in search_dirs:
+        if not proj_dir.exists():
+            continue
+        for f in proj_dir.glob("*.jsonl"):
+            mtime = f.stat().st_mtime
+            if mtime > latest_mtime:
+                latest_mtime = mtime
+                latest_file = f
+
+    if latest_file:
+        return {
+            'session_id': latest_file.stem,
+            'project_path': project_path or str(latest_file.parent.name),
+            'saved_at': time.time(),
+        }
+    return None
 
 # --- profile file helpers ---
 
@@ -153,7 +179,22 @@ def save_current_account():
         'displayName': account.get('displayName', ''),
         'oauthAccount': account,
         'userID': d.get('userID', ''),
+        'credential_version': CREDENTIAL_VERSION,
     }
+
+    session = get_last_session(os.getcwd())
+    if session:
+        existing_path = account_filename(email)
+        if existing_path.exists():
+            try:
+                existing = json.loads(existing_path.read_text())
+                sessions = existing.get('sessions', {})
+            except Exception:
+                sessions = {}
+        else:
+            sessions = {}
+        sessions[session['project_path']] = session['session_id']
+        profile['sessions'] = sessions
 
     path = account_filename(email)
     path.write_text(json.dumps(profile, indent=2))
@@ -161,9 +202,55 @@ def save_current_account():
 
     name = account.get('displayName', email)
     print(f"{GREEN}✓ Saved:{NC} {BOLD}{email}{NC} ({name})")
+    if session:
+        print(f"{DIM}  Session saved for current project.{NC}")
 
-def switch_to_account(profile: dict):
+def is_jetbrains_terminal() -> bool:
+    return os.environ.get('TERMINAL_EMULATOR', '').startswith('JetBrains')
+
+
+def open_new_terminal_window(command: str, cwd: str) -> bool:
+    """Opens a new terminal window in cwd running command. Returns True on success."""
+    full_cmd = f"cd {shlex.quote(cwd)} && {command}"
+    escaped = full_cmd.replace('\\', '\\\\').replace('"', '\\"')
+
+    # Try iTerm2 first
+    iterm_script = f'''
+tell application "iTerm2"
+    activate
+    set newWindow to (create window with default profile)
+    tell current session of newWindow
+        write text "{escaped}"
+    end tell
+end tell
+'''
+    r = subprocess.run(['osascript', '-e', iterm_script], capture_output=True, text=True)
+    if r.returncode == 0:
+        return True
+
+    # Fall back to Terminal.app
+    terminal_script = f'''
+tell application "Terminal"
+    activate
+    do script "{escaped}"
+end tell
+'''
+    r = subprocess.run(['osascript', '-e', terminal_script], capture_output=True, text=True)
+    return r.returncode == 0
+
+
+def switch_to_account(profile: dict, no_window: bool = False, exec_mode: bool = False):
     email = profile['email']
+
+    if profile.get('credential_version', 1) < CREDENTIAL_VERSION:
+        print(f"{YELLOW}⚠ Update notice: credential format has changed.{NC}")
+        print(f"{YELLOW}  You need to re-save both accounts once before switching.{NC}")
+        print()
+        print(f"  {BOLD}Step 1:{NC} Log in as account A → run {BOLD}claude-switch save{NC}")
+        print(f"  {BOLD}Step 2:{NC} Log out, log in as account B → run {BOLD}claude-switch save{NC}")
+        print(f"  {BOLD}Step 3:{NC} Switch normally with {BOLD}claude-switch{NC}")
+        sys.exit(1)
+
     credentials = get_profile_credentials(email)
     if not credentials:
         print(f"{RED}Error: no credentials found in keychain for {email}.{NC}")
@@ -180,7 +267,50 @@ def switch_to_account(profile: dict):
 
     name = profile.get('displayName', email)
     print(f"{GREEN}✓ Switched to:{NC} {BOLD}{email}{NC} ({name})")
-    print(f"{DIM}Restart Claude Code if it is already running.{NC}")
+
+    sessions = profile.get('sessions', {})
+    cwd = os.getcwd()
+    encoded = project_dir_name(cwd)
+    session_id = sessions.get(cwd) or sessions.get(encoded)
+
+    # Fallback: use the most recently active session for this project
+    if not session_id:
+        last = get_last_session(cwd)
+        if last:
+            session_id = last['session_id']
+
+    claude_cmd = f"claude --resume {session_id}" if session_id else "claude"
+    claude_args = ['claude', '--resume', session_id] if session_id else ['claude']
+
+    if exec_mode:
+        hint = " (resuming your session)" if session_id else ""
+        print(f"{GREEN}✓ Launching Claude Code{hint}...{NC}")
+        os.execvp('claude', claude_args)
+        return  # unreachable
+
+    in_jetbrains = is_jetbrains_terminal()
+
+    if no_window or in_jetbrains:
+        if in_jetbrains and not no_window:
+            print(f"{YELLOW}Running inside PHPStorm/JetBrains — open a new terminal tab and run:{NC}")
+        else:
+            print(f"\n{DIM}Run this in a new terminal:{NC}")
+        print(f"  {BOLD}cd {cwd}{NC}")
+        print(f"  {BOLD}{claude_cmd}{NC}")
+        print(f"{DIM}(Close this session to avoid auth conflicts.){NC}")
+        return
+
+    opened = open_new_terminal_window(claude_cmd, cwd)
+    if opened:
+        hint = " (resuming your session)" if session_id else ""
+        print(f"{GREEN}✓ New terminal window opened in {cwd}{hint}.{NC}")
+        print(f"{DIM}  Close this terminal to end your previous session.{NC}")
+    else:
+        print(f"\n{YELLOW}Could not open a new window automatically.{NC}")
+        print(f"{DIM}Run this in a new terminal:{NC}")
+        print(f"  {BOLD}cd {cwd}{NC}")
+        print(f"  {BOLD}{claude_cmd}{NC}")
+        print(f"{DIM}(Close this session to avoid auth conflicts.){NC}")
 
 def cmd_list():
     saved = list_saved_accounts()
@@ -190,13 +320,18 @@ def cmd_list():
         print(f"{YELLOW}No accounts saved. Run{NC} {BOLD}claude-switch save{NC} {YELLOW}to save the current account.{NC}")
         return
 
+    cwd = os.getcwd()
+    encoded = project_dir_name(cwd)
     print(f"\n{BOLD}Saved accounts:{NC}")
     for acc in saved:
         marker = f"  {GREEN}← active{NC}" if acc['email'] == current_email else ""
-        print(f"  • {BOLD}{acc['email']}{NC} ({acc.get('displayName', '')}){marker}")
+        sessions = acc.get('sessions', {})
+        session_id = sessions.get(cwd) or sessions.get(encoded)
+        session_hint = f"  {DIM}[session saved]{NC}" if session_id else ""
+        print(f"  • {BOLD}{acc['email']}{NC} ({acc.get('displayName', '')}){marker}{session_hint}")
     print()
 
-def interactive_switch():
+def interactive_switch(no_window: bool = False, exec_mode: bool = False):
     current = get_current_account()
     current_email = current.get('emailAddress', '')
 
@@ -231,7 +366,7 @@ def interactive_switch():
             prompt = f"  Switch to {BOLD}{others[0]['email']}{NC}? [y/N] "
             choice = input(prompt).strip().lower()
             if choice in ('y', 'yes'):
-                switch_to_account(others[0])
+                switch_to_account(others[0], no_window=no_window, exec_mode=exec_mode)
             else:
                 print("  No changes made.")
         else:
@@ -241,7 +376,7 @@ def interactive_switch():
                 return
             idx = int(choice) - 1
             if 0 <= idx < len(others):
-                switch_to_account(others[idx])
+                switch_to_account(others[idx], no_window=no_window, exec_mode=exec_mode)
             else:
                 print(f"{RED}  Invalid selection.{NC}")
     except (ValueError, KeyboardInterrupt, EOFError):
@@ -257,31 +392,50 @@ def show_help():
 {BOLD}claude-switch{NC} — Switch between Claude Code accounts without re-authenticating
 
 {BOLD}Usage:{NC}
-  claude-switch              Interactive switcher
-  claude-switch save         Save current credentials as a profile
-  claude-switch list         List all saved profiles
-  claude-switch use <email>  Switch non-interactively
+  claude-switch                       Switch and launch Claude in this terminal (default)
+  claude-switch --new-window          Switch and open Claude in a new terminal window
+  claude-switch --no-window           Switch and print the command to run manually
+  claude-switch save                  Save current credentials as a profile
+  claude-switch list                  List all saved profiles
+  claude-switch use <email>           Switch non-interactively (launches in this terminal)
+  claude-switch use <email> --new-window  Switch and open Claude in a new terminal window
+  claude-switch use <email> --no-window   Switch and print the command to run manually
 
 {BOLD}First-time setup:{NC}
   1. You're logged in as account A — run:  {BOLD}claude-switch save{NC}
   2. Log out and log in as account B
   3. Save it too:                          {BOLD}claude-switch save{NC}
   4. Switch at any time with:              {BOLD}claude-switch{NC}
+
+{BOLD}How switching works:{NC}
+  By default, switching launches Claude directly in the current terminal (replacing this process).
+  Use --new-window to open a separate terminal window instead.
+  Supports iTerm2 and Terminal.app automatically.
+
+{BOLD}Session resume:{NC}
+  Run {BOLD}claude-switch save{NC} inside a project to snapshot the current session.
+  After switching back to that account, the saved session is resumed automatically.
 """)
 
 def main():
     setup()
     args = sys.argv[1:]
 
+    no_window = '--no-window' in args
+    new_window = '--new-window' in args
+    args = [a for a in args if a not in ('--no-window', '--new-window', '--exec')]
+
+    exec_mode = not no_window and not new_window
+
     if not args:
-        interactive_switch()
+        interactive_switch(no_window=no_window, exec_mode=exec_mode)
     elif args[0] == 'save':
         save_current_account()
     elif args[0] == 'list':
         cmd_list()
     elif args[0] == 'use':
         if len(args) < 2:
-            print(f"{RED}Usage: claude-switch use <email>{NC}")
+            print(f"{RED}Usage: claude-switch use <email> [--no-window|--new-window]{NC}")
             sys.exit(1)
         email = args[1]
         saved = list_saved_accounts()
@@ -289,7 +443,7 @@ def main():
         if not match:
             print(f"{RED}Account '{email}' not found. Run 'claude-switch list' to see saved accounts.{NC}")
             sys.exit(1)
-        switch_to_account(match)
+        switch_to_account(match, no_window=no_window, exec_mode=exec_mode)
     elif args[0] in ('help', '--help', '-h'):
         show_help()
     else:

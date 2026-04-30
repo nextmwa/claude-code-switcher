@@ -57,14 +57,21 @@ claude-switch
 ## Usage
 
 ```
-claude-switch              Interactive switcher (shows current + options)
-claude-switch save         Save current account credentials as a profile
-claude-switch list         List all saved profiles
-claude-switch use <email>  Switch non-interactively (useful in scripts)
-claude-switch --help       Show help
+claude-switch                        Interactive switcher — switches and launches Claude here
+claude-switch --new-window           Switch and open Claude in a new terminal window
+claude-switch --no-window            Switch and print the command to run manually
+claude-switch save                   Save current account credentials as a profile
+claude-switch list                   List all saved profiles
+claude-switch use <email>            Switch non-interactively (launches in this terminal)
+claude-switch use <email> --new-window  Switch and open Claude in a new terminal window
+claude-switch --help                 Show help
 ```
 
-After switching, restart Claude Code if it's already running.
+By default, `claude-switch` replaces the current terminal process with `claude` (or `claude --resume <session>` if a session is saved for the current project). Use `--new-window` to open a separate iTerm2 or Terminal window instead.
+
+## Session resume
+
+Run `claude-switch save` inside a project directory to snapshot the current session ID. When you switch back to that account, `claude-switch` automatically resumes where you left off.
 
 ## Where profiles are stored
 
