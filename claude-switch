@@ -586,6 +586,32 @@ def _print_setup_hint(current_email, saved):
         print(f"  {DIM}Tip: run {BOLD}claude-switch save{NC}{DIM} to save the current account.{NC}")
     print()
 
+def cmd_setup_statusline():
+    claude_settings = Path.home() / ".claude" / "settings.json"
+    try:
+        data = json.loads(claude_settings.read_text()) if claude_settings.exists() else {}
+    except Exception:
+        data = {}
+
+    existing = data.get('statusLine', {})
+    if existing.get('command') == 'claude-switch usage --compact':
+        print(f"{YELLOW}Statusline already configured.{NC}")
+        return
+
+    data['statusLine'] = {
+        'type': 'command',
+        'command': 'claude-switch usage --compact',
+        'refreshInterval': 60,
+    }
+
+    claude_settings.parent.mkdir(parents=True, exist_ok=True)
+    tmp = claude_settings.with_suffix('.json.tmp')
+    tmp.write_text(json.dumps(data, indent=2) + '\n')
+    tmp.replace(claude_settings)
+
+    print(f"{GREEN}✓ Statusline configured.{NC} Token usage bars will appear below the Claude Code chat.")
+    print(f"{DIM}  Restart Claude Code to apply.{NC}")
+
 def show_help():
     print(f"""
 {BOLD}claude-switch{NC} — Switch between Claude Code accounts without re-authenticating
@@ -598,6 +624,7 @@ def show_help():
   claude-switch live                  Live dashboard: barre aggiornate ogni 60s
   claude-switch save                  Save current credentials as a profile
   claude-switch list                  List all saved profiles
+  claude-switch statusline            Add usage bars to Claude Code (run once per machine)
   claude-switch use <email>           Switch non-interactively (launches in this terminal)
   claude-switch use <email> --new-window  Switch and open Claude in a new terminal window
   claude-switch use <email> --no-window   Switch and print the command to run manually
@@ -636,6 +663,8 @@ def main():
         cmd_list()
     elif args[0] == 'live':
         cmd_live()
+    elif args[0] == 'statusline':
+        cmd_setup_statusline()
     elif args[0] == 'usage':
         if '--compact' in args:
             cmd_usage_compact()
