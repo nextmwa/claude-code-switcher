@@ -330,7 +330,9 @@ def cmd_usage_compact():
             continue
         pct_used = entry.get('utilization') or 0.0
         bar = render_bar(pct_used, width=8)
-        parts.append(f'{label} {bar} {pct_used:.0f}%')
+        resets = format_reset_time(entry.get('resets_at'))
+        reset_str = f' reset:{resets[7:]}' if resets else ''  # strip "resets " prefix
+        parts.append(f'{label} {bar} {pct_used:.0f}%{reset_str}')
     print('  │  '.join(parts))
 
 def cmd_usage():
