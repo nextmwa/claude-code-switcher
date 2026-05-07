@@ -452,6 +452,14 @@ def switch_to_account(profile: dict, no_window: bool = False, exec_mode: bool = 
         print(f"  {BOLD}Step 3:{NC} Switch normally with {BOLD}claude-switch{NC}")
         sys.exit(1)
 
+    # Auto-save current account's fresh token before switching away from it
+    current_account = get_current_account()
+    current_email = current_account.get('emailAddress', '')
+    if current_email and current_email != email:
+        current_creds = get_keychain_credentials()
+        if current_creds:
+            set_profile_credentials(current_email, current_creds)
+
     credentials = get_profile_credentials(email)
     if not credentials:
         print(f"{RED}Error: no credentials found in keychain for {email}.{NC}")
@@ -460,6 +468,13 @@ def switch_to_account(profile: dict, no_window: bool = False, exec_mode: bool = 
     if not set_keychain_credentials(credentials):
         print(f"{RED}Error: could not update keychain.{NC}")
         sys.exit(1)
+
+    # Invalidate usage cache so new account's data loads fresh
+    try:
+        if USAGE_CACHE.exists():
+            USAGE_CACHE.unlink()
+    except Exception:
+        pass
 
     d = read_claude_json()
     d['oauthAccount'] = profile['oauthAccount']
